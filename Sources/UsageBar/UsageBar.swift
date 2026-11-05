@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct Window { var used: Double; var resetsAt: Date? }
-struct Usage { var session: Window; var week: Window }
+struct Usage { var session: Window?; var week: Window? }
 
 @main
 struct UsageBarApp: App {
@@ -26,8 +26,8 @@ struct UsageBarApp: App {
         case nil: Text("\(name): loading…")
         case .failure(let e): Text("\(name): \(e.localizedDescription)")
         case .success(let u):
-            Text("\(name) 5h: \(left(u.session))")
-            Text("\(name) week: \(left(u.week))")
+            if let s = u.session { Text("\(name) 5h: \(left(s))") }
+            if let w = u.week { Text("\(name) week: \(left(w))") }
         }
     }
 
@@ -39,10 +39,11 @@ struct UsageBarApp: App {
     }
 }
 
-/// Two stacked bars, Claude on top, Codex below; fill = share of the 5h window left.
+/// Two stacked bars, Claude on top, Codex below; fill = share of the 5h window left (week if there is no 5h limit).
 @MainActor func icon(_ top: Result<Usage, Error>?, _ bottom: Result<Usage, Error>?) -> NSImage {
     func bar(_ r: Result<Usage, Error>?, _ color: Color) -> some View {
-        let left = (try? r?.get()).map { max(0, 1 - $0.session.used / 100) } ?? 0
+        let w = (try? r?.get()).flatMap { $0.session ?? $0.week }
+        let left = w.map { max(0, 1 - $0.used / 100) } ?? 0
         return ZStack(alignment: .leading) {
             Capsule().fill(color.opacity(0.3))
             Capsule().fill(color).frame(width: 22 * left)
@@ -107,7 +108,7 @@ func fetchClaude() async throws -> Usage {
 
 struct CodexAuth: Decodable { struct T: Decodable { let access_token: String; let account_id: String? }; let tokens: T }
 struct CodexUsage: Decodable {
-    struct W: Decodable { let used_percent: Double; let reset_at: Double? }
+    struct W: Decodable { let used_percent: Double; let reset_at: Double?; let limit_window_seconds: Double }
     struct RL: Decodable { let primary_window: W?; let secondary_window: W? }
     let rate_limit: RL?
 }
@@ -119,10 +120,12 @@ func fetchCodex() async throws -> Usage {
     req.setValue("Bearer \(auth.access_token)", forHTTPHeaderField: "Authorization")
     req.setValue(auth.account_id, forHTTPHeaderField: "ChatGPT-Account-Id")
     let u = try await get(CodexUsage.self, req)
-    func w(_ w: CodexUsage.W?) -> Window {
-        Window(used: w?.used_percent ?? 0, resetsAt: w?.reset_at.map { Date(timeIntervalSince1970: $0) })
+    // primary/secondary aren't fixed to 5h/week: some plans only get a weekly limit, sent as primary.
+    let windows = [u.rate_limit?.primary_window, u.rate_limit?.secondary_window].compactMap { $0 }
+    func w(_ match: (Double) -> Bool) -> Window? {
+        windows.first { match($0.limit_window_seconds) }.map { Window(used: $0.used_percent, resetsAt: $0.reset_at.map { Date(timeIntervalSince1970: $0) }) }
     }
-    return Usage(session: w(u.rate_limit?.primary_window), week: w(u.rate_limit?.secondary_window))
+    return Usage(session: w { $0 < 86400 }, week: w { $0 >= 86400 })
 }
 
 // MARK: Helpers
